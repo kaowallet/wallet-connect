@@ -424,12 +424,13 @@ async fn local_validation_of_requests_and_permissions() {
         .await;
     assert!(matches!(unauthorized, Err(Error::Protocol(e)) if e.code == 3001));
 
-    // Only the controller (wallet) may update or extend.
+    // Only the controller (wallet) may update; either peer may extend, as
+    // with the reference SDK.
     assert!(matches!(
         dapp.update(topic, session.namespaces.clone()).await,
         Err(Error::Protocol(e)) if e.code == 3003
     ));
-    assert!(matches!(dapp.extend(topic).await, Err(Error::Protocol(e)) if e.code == 3004));
+    dapp.extend(topic).await.unwrap().await.unwrap();
 
     // Events must be granted.
     assert!(matches!(
