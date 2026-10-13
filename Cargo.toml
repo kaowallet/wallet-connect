@@ -1,0 +1,52 @@
+[package]
+name = "wallet-connect"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-only"
+description = "WalletConnect v2 protocol (pairing, relay, Sign API) for dapps and wallets, plus a local relay server"
+readme = "README.md"
+keywords = ["walletconnect", "wallet", "web3", "relay", "crypto"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+default = ["ws"]
+# WebSocket transport (client) and WebSocket listener for the bundled relay server.
+ws = ["dep:tokio-tungstenite", "dep:rustls"]
+
+[dependencies]
+base64 = "0.23.1"
+bs58 = "0.5.1"
+chacha20poly1305 = "0.11.0"
+ed25519-dalek = "3.0.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
+getrandom = "0.4.3"
+hex = "0.4.3"
+hkdf = "0.13.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tracing = "0.1.44"
+url = "2.5.8"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+
+tokio-tungstenite = { version = "0.30.0", optional = true, features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "relay_server"
+required-features = ["ws"]
+
+[[example]]
+name = "dapp"
+required-features = ["ws"]
+
+[[example]]
+name = "wallet"
+required-features = ["ws"]
