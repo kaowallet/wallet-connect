@@ -26,7 +26,7 @@ The Sign client implements every `wc_session*` and `wc_pairing*` method:
 | `wc_sessionPropose` | 1100/1101 (reject 1120, auto-reject 1121) | dapp |
 | `wc_sessionSettle` | 1102/1103 | wallet |
 | `wc_sessionUpdate` | 1104/1105 | wallet (controller) |
-| `wc_sessionExtend` | 1106/1107 | wallet (controller) |
+| `wc_sessionExtend` | 1106/1107 | either |
 | `wc_sessionRequest` | 1108/1109 | dapp |
 | `wc_sessionEvent` | 1110/1111 | wallet |
 | `wc_sessionDelete` | 1112 | either |
@@ -114,9 +114,13 @@ no rate limiting, persistence or clustering.
   inputs: derived key, topic, all three envelope types, `did:key`, the full
   relay JWT, the pairing URI, and the subscription id. `interop/js/vectors.mjs`
   regenerates them.
+* `tests/js_utils.rs`, `tests/js_core.rs` and `tests/js_sign_client.rs` port
+  the JS SDK's own test suites (`@walletconnect/utils`, `core` and
+  `sign-client` 2.26.0) to this crate. [`docs/js-test-port.md`](docs/js-test-port.md)
+  maps every JS test to its port, or says why it has none.
 * `interop/run.sh` starts this crate's relay and runs a full session (pair,
-  propose, approve, settle, event, request/response, rejection, ping, delete)
-  for every combination:
+  propose, approve, settle, event, request/response, rejection, ping, extend,
+  delete) for every combination:
 
   ```
   $ interop/run.sh
@@ -137,6 +141,15 @@ Compatibility choices worth knowing:
   break.
 * Out-of-order `wc_sessionUpdate`s and events are discarded by comparing the
   timestamps embedded in request ids, as the reference SDK does.
+* Either peer may extend a session. The spec is ambiguous here, and the
+  reference SDK lets dapps call `extend` too.
+* Pairing the same URI again while its proposal is unanswered emits the
+  proposal again. When a dapp settles a session, it deletes its older pairings
+  with the same wallet (same metadata URL).
+* Unlike the reference SDK 2.26, `connect` sends `requiredNamespaces` as given
+  instead of folding them into `optionalNamespaces`, wallets get every
+  session request right away instead of one at a time, and an active pairing
+  lives for 30 days (as the pairing spec says) rather than five minutes.
 
 ## Not implemented
 
@@ -146,7 +159,7 @@ the Verify attestation API, and the Notify API.
 ## Development
 
 ```sh
-cargo test                          # unit, vector, relay and end-to-end tests
+cargo test                          # unit, vector, ported JS SDK, relay and end-to-end tests
 cargo clippy --all-targets          # lint
 interop/run.sh                      # live checks against the JS SDK (needs node + npm)
 ```
