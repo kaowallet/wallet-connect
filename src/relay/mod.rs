@@ -9,6 +9,8 @@ mod transport;
 mod ws;
 
 pub use client::{PublishOptions, RelayClient, RelayClientOptions, RelayEvent};
+#[doc(hidden)]
+pub use server::ServerStats;
 pub use server::{RelayServer, ServerConnector};
 pub use transport::{BoxFuture, Connection, Connector};
 #[cfg(feature = "ws")]

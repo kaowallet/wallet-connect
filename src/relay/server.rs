@@ -3,7 +3,8 @@
 //! It implements the subset of the relay API that WalletConnect clients use,
 //! with the relay's store-and-forward semantics: published messages are kept
 //! for their TTL and pushed to every subscriber that has not acknowledged them
-//! yet, including subscribers that only show up later. It's meant for tests,
+//! yet, including subscribers that only show up later. Once a message expires,
+//! the relay forgets it along with who acknowledged it. It's meant for tests,
 //! local development and private deployments, not as a replacement for the
 //! production relay network (no rate limiting, persistence or clustering).
 //!
@@ -11,12 +12,15 @@
 //! [`RelayServer::connector`]) or over WebSocket ([`RelayServer::listen`],
 //! with the `ws` feature).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use super::rpc::{self, MAX_TTL, MIN_TTL, SubscriptionData, SubscriptionParams, methods};
 use super::transport::{BoxFuture, Connection, Connector};
@@ -32,6 +36,9 @@ const TAG_SESSION_PROPOSE_RESPONSE: u32 = 1101;
 const TAG_SESSION_SETTLE: u32 = 1102;
 
 /// A relay. Cheap to clone; clones share state.
+///
+/// Message TTLs are measured on tokio's clock, so tests running on paused
+/// time can expire messages with `tokio::time::advance`.
 #[derive(Clone, Default)]
 pub struct RelayServer {
     state: Arc<Mutex<ServerState>>,
@@ -41,9 +48,13 @@ pub struct RelayServer {
 struct ServerState {
     next_conn: u64,
     conns: HashMap<u64, Conn>,
+    /// Topics with stored messages or subscribers.
     topics: HashMap<Topic, TopicState>,
-    /// client id → ids of the messages it acknowledged
-    acked: HashMap<String, HashSet<String>>,
+    /// message id → what the relay remembers about the message while it's
+    /// stored on at least one topic
+    messages: HashMap<String, MessageState>,
+    /// expiry → topic of each stored message expiring then
+    expiries: BTreeMap<Instant, Vec<Topic>>,
 }
 
 struct Conn {
@@ -51,10 +62,9 @@ struct Conn {
     tx: mpsc::UnboundedSender<String>,
     /// topic → subscription id
     subscriptions: HashMap<Topic, String>,
-    /// push request id → message id, until the client acknowledges it
+    /// push request id → message id, until the client acknowledges it or
+    /// the message expires
     in_flight: HashMap<u64, String>,
-    /// messages pushed on this connection (acknowledged or not)
-    delivered: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -67,8 +77,44 @@ struct Stored {
     /// sha256 of the message
     id: String,
     data: SubscriptionData,
-    expires_at_ms: u64,
+    expires_at: Instant,
     publisher: String,
+}
+
+/// Who has seen a stored message. Message ids are payload hashes, so a
+/// payload published on several topics is one message: acknowledging it once
+/// covers every topic.
+#[derive(Default)]
+struct MessageState {
+    /// Number of topics storing the message.
+    copies: usize,
+    /// Clients that acknowledged or fetched it. It isn't delivered to them
+    /// again.
+    acked_by: HashSet<String>,
+    /// connection → push request id, for the connections it was pushed on
+    /// that haven't acknowledged it yet (the inverse of [`Conn::in_flight`])
+    awaiting_ack: HashMap<u64, u64>,
+}
+
+/// Sizes of a [`RelayServer`]'s internal tables, see [`RelayServer::stats`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerStats {
+    /// Topics with stored messages or subscribers.
+    pub topics: usize,
+    /// Stored messages, summed over topics.
+    pub stored_messages: usize,
+    /// Expiry index entries, one per stored message.
+    pub expiry_entries: usize,
+    /// Messages with acknowledgement state (a payload stored on several
+    /// topics counts once).
+    pub message_states: usize,
+    /// (client, message) acknowledgements.
+    pub acks: usize,
+    /// Pushes awaiting acknowledgement, summed over connections.
+    pub in_flight: usize,
+    /// The same pushes, summed over messages.
+    pub awaiting_ack: usize,
 }
 
 type RpcResult = std::result::Result<Value, ErrorObject>;
@@ -97,7 +143,6 @@ impl RelayServer {
                     tx: sender,
                     subscriptions: HashMap::new(),
                     in_flight: HashMap::new(),
-                    delivered: HashSet::new(),
                 },
             );
             id
@@ -139,10 +184,26 @@ impl RelayServer {
 
     /// Number of unexpired messages stored for `topic`.
     pub fn stored_message_count(&self, topic: &Topic) -> usize {
-        let now = now_ms();
+        let now = Instant::now();
         self.state.lock().unwrap().topics.get(topic).map_or(0, |t| {
-            t.messages.iter().filter(|m| m.expires_at_ms > now).count()
+            t.messages.iter().filter(|m| m.expires_at > now).count()
         })
+    }
+
+    /// Sizes of the internal tables, for tests. Expired messages are only
+    /// swept when the next frame arrives, and count until then.
+    #[doc(hidden)]
+    pub fn stats(&self) -> ServerStats {
+        let state = self.state.lock().unwrap();
+        ServerStats {
+            topics: state.topics.len(),
+            stored_messages: state.topics.values().map(|t| t.messages.len()).sum(),
+            expiry_entries: state.expiries.values().map(Vec::len).sum(),
+            message_states: state.messages.len(),
+            acks: state.messages.values().map(|m| m.acked_by.len()).sum(),
+            in_flight: state.conns.values().map(|c| c.in_flight.len()).sum(),
+            awaiting_ack: state.messages.values().map(|m| m.awaiting_ack.len()).sum(),
+        }
     }
 }
 
@@ -172,6 +233,7 @@ impl ServerState {
         if !self.conns.contains_key(&conn_id) {
             return false;
         }
+        self.expire(Instant::now());
         let value: Value = match serde_json::from_str(text) {
             Ok(v) => v,
             Err(e) => {
@@ -333,26 +395,35 @@ impl ServerState {
             ));
         }
         let publisher = self.conns[&conn_id].client_id.clone();
-        let now = now_ms();
+        let now = Instant::now();
         let ttl = p.ttl.clamp(MIN_TTL, MAX_TTL);
         let id = sha256_hex(p.message.as_bytes());
         let topic = self.topics.entry(p.topic.clone()).or_default();
-        topic.messages.retain(|m| m.expires_at_ms > now);
         // Publishing is idempotent: a retried publish is not a new message.
-        if !topic.messages.iter().any(|m| m.id == id) {
+        if !topic
+            .messages
+            .iter()
+            .any(|m| m.id == id && m.expires_at > now)
+        {
+            let expires_at = now + Duration::from_secs(ttl);
             topic.messages.push(Stored {
-                id,
+                id: id.clone(),
                 data: SubscriptionData {
                     topic: p.topic.clone(),
                     message: p.message,
-                    published_at: now,
+                    published_at: now_ms(),
                     tag: p.tag,
                     attestation: p.attestation,
                 },
-                expires_at_ms: now + ttl * 1000,
+                expires_at,
                 publisher,
             });
             let subscribers: Vec<u64> = topic.subscribers.iter().copied().collect();
+            self.messages.entry(id).or_default().copies += 1;
+            self.expiries
+                .entry(expires_at)
+                .or_default()
+                .push(p.topic.clone());
             for subscriber in subscribers {
                 self.deliver(subscriber, &p.topic);
             }
@@ -379,6 +450,7 @@ impl ServerState {
         if let Some(t) = self.topics.get_mut(topic) {
             t.subscribers.remove(&conn_id);
         }
+        self.drop_if_unused(topic);
     }
 
     /// Messages on `topics` that `conn_id`'s client has neither published
@@ -388,16 +460,15 @@ impl ServerState {
         client_id: &'a str,
         topic: &Topic,
     ) -> impl Iterator<Item = &'a Stored> + 'a {
-        let now = now_ms();
-        let acked = self.acked.get(client_id);
+        let now = Instant::now();
         self.topics
             .get(topic)
             .into_iter()
             .flat_map(|t| t.messages.iter())
             .filter(move |m| {
-                m.expires_at_ms > now
+                m.expires_at > now
                     && m.publisher != client_id
-                    && !acked.is_some_and(|a| a.contains(&m.id))
+                    && !self.messages[&m.id].acked_by.contains(client_id)
             })
     }
 
@@ -412,7 +483,7 @@ impl ServerState {
         };
         let pushes: Vec<(String, SubscriptionData)> = self
             .pending_for(&conn.client_id, topic)
-            .filter(|m| !conn.delivered.contains(&m.id))
+            .filter(|m| !self.messages[&m.id].awaiting_ack.contains_key(&conn_id))
             .map(|m| (m.id.clone(), m.data.clone()))
             .collect();
         let conn = self.conns.get_mut(&conn_id).expect("checked above");
@@ -427,7 +498,11 @@ impl ServerState {
             if conn.tx.send(push.to_string()).is_err() {
                 return;
             }
-            conn.delivered.insert(msg_id.clone());
+            self.messages
+                .get_mut(&msg_id)
+                .expect("pushed messages are stored")
+                .awaiting_ack
+                .insert(conn_id, push_id);
             conn.in_flight.insert(push_id, msg_id);
         }
     }
@@ -443,12 +518,12 @@ impl ServerState {
             }
         }
         // Fetched messages count as delivered and acknowledged.
-        self.acked
-            .entry(client_id)
-            .or_default()
-            .extend(ids.iter().cloned());
-        if let Some(conn) = self.conns.get_mut(&conn_id) {
-            conn.delivered.extend(ids);
+        for id in ids {
+            self.messages
+                .get_mut(&id)
+                .expect("fetched messages are stored")
+                .acked_by
+                .insert(client_id.clone());
         }
         serde_json::to_value(rpc::FetchMessagesResult {
             messages,
@@ -462,8 +537,12 @@ impl ServerState {
             return;
         };
         if let Some(msg_id) = conn.in_flight.remove(&push_id) {
-            let client_id = conn.client_id.clone();
-            self.acked.entry(client_id).or_default().insert(msg_id);
+            let message = self
+                .messages
+                .get_mut(&msg_id)
+                .expect("in-flight messages are stored");
+            message.awaiting_ack.remove(&conn_id);
+            message.acked_by.insert(conn.client_id.clone());
         }
     }
 
@@ -473,7 +552,63 @@ impl ServerState {
                 if let Some(t) = self.topics.get_mut(topic) {
                     t.subscribers.remove(&conn_id);
                 }
+                self.drop_if_unused(topic);
             }
+            for msg_id in conn.in_flight.values() {
+                if let Some(message) = self.messages.get_mut(msg_id) {
+                    message.awaiting_ack.remove(&conn_id);
+                }
+            }
+        }
+    }
+
+    /// Drop the messages that expired by `now`, with everything known about
+    /// them, and the topics this leaves without messages or subscribers.
+    fn expire(&mut self, now: Instant) {
+        let mut topics = HashSet::new();
+        while let Some(entry) = self.expiries.first_entry() {
+            if *entry.key() > now {
+                break;
+            }
+            topics.extend(entry.remove());
+        }
+        for topic in topics {
+            let Some(t) = self.topics.get_mut(&topic) else {
+                continue;
+            };
+            let expired: Vec<Stored> = t.messages.extract_if(.., |m| m.expires_at <= now).collect();
+            self.drop_if_unused(&topic);
+            for m in expired {
+                self.release(m.id);
+            }
+        }
+    }
+
+    /// Account for one fewer stored copy of message `id`, forgetting the
+    /// message once no topic stores it.
+    fn release(&mut self, id: String) {
+        let Entry::Occupied(mut entry) = self.messages.entry(id) else {
+            return;
+        };
+        entry.get_mut().copies -= 1;
+        if entry.get().copies > 0 {
+            return;
+        }
+        for (conn_id, push_id) in entry.remove().awaiting_ack {
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.in_flight.remove(&push_id);
+            }
+        }
+    }
+
+    /// Forget `topic` once it has neither messages nor subscribers.
+    fn drop_if_unused(&mut self, topic: &Topic) {
+        if self
+            .topics
+            .get(topic)
+            .is_some_and(|t| t.messages.is_empty() && t.subscribers.is_empty())
+        {
+            self.topics.remove(topic);
         }
     }
 }
