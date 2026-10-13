@@ -2,12 +2,14 @@
 
 use std::time::Duration;
 
+use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 use wallet_connect::crypto::Topic;
-use wallet_connect::relay::rpc::{ApproveSessionParams, ProposeSessionParams};
+use wallet_connect::relay::rpc::{ApproveSessionParams, MIN_TTL, ProposeSessionParams, methods};
 use wallet_connect::relay::{
-    PublishOptions, RelayClient, RelayClientOptions, RelayEvent, RelayServer,
+    Connection, PublishOptions, RelayClient, RelayClientOptions, RelayEvent, RelayServer,
+    ServerStats,
 };
 
 const OPTS: PublishOptions = PublishOptions {
@@ -43,6 +45,55 @@ async fn assert_quiet(events: &mut UnboundedReceiver<RelayEvent>) {
     {
         panic!("unexpected message {m:?}");
     }
+}
+
+/// Let the relay and its clients work through everything queued. On paused
+/// time this returns only once every task is idle.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+}
+
+/// A raw connection as `client_id`, subscribed to `topic`. Unlike
+/// [`RelayClient`], it acknowledges nothing by itself.
+async fn raw_subscriber(server: &RelayServer, client_id: &str, topic: &Topic) -> Connection {
+    let mut conn = server.accept(client_id);
+    let subscribe = json!({
+        "id": 1,
+        "jsonrpc": "2.0",
+        "method": methods::SUBSCRIBE,
+        "params": { "topic": topic },
+    });
+    conn.sender.send(subscribe.to_string()).unwrap();
+    let response = timeout(Duration::from_secs(5), conn.receiver.recv())
+        .await
+        .expect("no response within 5s")
+        .expect("connection closed");
+    assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 1);
+    conn
+}
+
+/// Everything pushed on a raw connection since the last call.
+async fn drain_pushes(conn: &mut Connection) -> Vec<Value> {
+    settle().await;
+    std::iter::from_fn(|| conn.receiver.try_recv().ok())
+        .map(|text| {
+            let push: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(push["method"], methods::SUBSCRIPTION);
+            push
+        })
+        .collect()
+}
+
+fn pushed_messages(pushes: &[Value]) -> Vec<&str> {
+    pushes
+        .iter()
+        .map(|p| p["params"]["data"]["message"].as_str().unwrap())
+        .collect()
+}
+
+fn ack(conn: &Connection, push: &Value) {
+    let ack = json!({ "id": push["id"], "jsonrpc": "2.0", "result": true });
+    conn.sender.send(ack.to_string()).unwrap();
 }
 
 #[tokio::test]
@@ -229,6 +280,128 @@ async fn combined_session_methods() {
         next_message(&mut wallet_events).await,
         (session, "settle ack".into())
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_messages_are_forgotten() {
+    let server = RelayServer::new();
+    let (alice, _) = client(&server, "alice").await;
+    let (bob, mut bob_events) = client(&server, "bob").await;
+    let (carol, _) = client(&server, "carol").await;
+    let short = PublishOptions {
+        ttl: MIN_TTL,
+        ..OPTS
+    };
+    let watched = Topic::generate();
+    let mailbox = Topic::generate();
+
+    // Bob acknowledges the pushes, mallory never does, carol fetches.
+    bob.subscribe(&watched).await.unwrap();
+    let mut mallory = raw_subscriber(&server, "mallory", &watched).await;
+    alice.publish(&watched, "m1", short).await.unwrap();
+    alice.publish(&watched, "m2", short).await.unwrap();
+    assert_eq!(next_message(&mut bob_events).await.1, "m1");
+    assert_eq!(next_message(&mut bob_events).await.1, "m2");
+    // Unacknowledged pushes aren't repeated on the same connection.
+    let pushes = drain_pushes(&mut mallory).await;
+    assert_eq!(pushed_messages(&pushes), ["m1", "m2"]);
+    alice.publish(&mailbox, "m3", short).await.unwrap();
+    assert_eq!(
+        carol.fetch_messages(&mailbox).await.unwrap().messages.len(),
+        1
+    );
+    settle().await;
+    assert_eq!(
+        server.stats(),
+        ServerStats {
+            topics: 2,
+            stored_messages: 3,
+            expiry_entries: 3,
+            message_states: 3,
+            acks: 3,
+            in_flight: 2,
+            awaiting_ack: 2,
+        }
+    );
+
+    // Until they expire, acknowledged messages aren't delivered to bob
+    // again, even on a new connection.
+    drop(bob);
+    let (bob, mut bob_events) = client(&server, "bob").await;
+    bob.subscribe(&watched).await.unwrap();
+    assert_quiet(&mut bob_events).await;
+    assert_eq!(server.stored_message_count(&watched), 2);
+
+    // Once they have expired, the next frame sweeps them along with who
+    // acknowledged them and the pushes awaiting acknowledgement. The
+    // mailbox goes too; `watched` still has subscribers.
+    tokio::time::advance(Duration::from_secs(MIN_TTL + 1)).await;
+    assert!(
+        carol
+            .fetch_messages(&mailbox)
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+    let only_watched = ServerStats {
+        topics: 1,
+        ..ServerStats::default()
+    };
+    assert_eq!(server.stats(), only_watched);
+
+    // Late acknowledgements of expired messages are ignored.
+    for push in &pushes {
+        ack(&mallory, push);
+    }
+    settle().await;
+    assert_eq!(server.stats(), only_watched);
+
+    // A topic without messages goes with its last subscriber.
+    bob.unsubscribe(&watched).await.unwrap();
+    drop(mallory);
+    settle().await;
+    assert_eq!(server.stats(), ServerStats::default());
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_connections_and_unused_topics_are_forgotten() {
+    let server = RelayServer::new();
+    let (alice, _) = client(&server, "alice").await;
+    let stored = Topic::generate();
+    let empty = Topic::generate();
+    alice.publish(&stored, "kept", OPTS).await.unwrap();
+
+    alice.subscribe(&empty).await.unwrap();
+    assert_eq!(server.stats().topics, 2);
+    alice.unsubscribe(&empty).await.unwrap();
+    assert_eq!(server.stats().topics, 1);
+
+    // Pushes a connection never acknowledged are forgotten when it closes...
+    let mut mallory = raw_subscriber(&server, "mallory", &stored).await;
+    assert_eq!(pushed_messages(&drain_pushes(&mut mallory).await), ["kept"]);
+    assert_eq!(server.stats().in_flight, 1);
+    drop(mallory);
+    settle().await;
+    assert_eq!(
+        server.stats(),
+        ServerStats {
+            topics: 1,
+            stored_messages: 1,
+            expiry_entries: 1,
+            message_states: 1,
+            ..ServerStats::default()
+        }
+    );
+
+    // ...and the message is pushed again on the client's next connection.
+    let mut mallory = raw_subscriber(&server, "mallory", &stored).await;
+    let pushes = drain_pushes(&mut mallory).await;
+    assert_eq!(pushed_messages(&pushes), ["kept"]);
+    ack(&mallory, &pushes[0]);
+    settle().await;
+    let stats = server.stats();
+    assert_eq!((stats.acks, stats.in_flight, stats.awaiting_ack), (1, 0, 0));
 }
 
 #[cfg(feature = "ws")]
