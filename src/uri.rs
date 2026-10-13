@@ -11,7 +11,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::alphabet;
+use base64::engine::DecodePaddingMode;
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use url::form_urlencoded;
 
 use crate::crypto::{SymKey, Topic};
@@ -20,6 +22,12 @@ use crate::error::{Error, Result};
 pub const PROTOCOL: &str = "wc";
 pub const VERSION: u32 = 2;
 pub const DEFAULT_RELAY_PROTOCOL: &str = "irn";
+
+/// Standard base64, with or without padding.
+const BASE64_LENIENT: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
 
 /// A parsed `wc:` pairing URI.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,20 +65,29 @@ impl FromStr for PairingUri {
         let invalid = |m: String| Error::InvalidUri(m);
         let mut s = input.trim().to_owned();
 
-        // The reference SDK also accepts a base64-encoded URI.
+        // The reference SDK also accepts a base64-encoded URI, padded or not
+        // (Telegram deep links strip the padding).
         if !s.contains("wc:")
-            && let Ok(decoded) = STANDARD.decode(&s)
+            && let Ok(decoded) = BASE64_LENIENT.decode(&s)
             && let Ok(decoded) = String::from_utf8(decoded)
             && decoded.contains("wc:")
         {
             s = decoded;
         }
 
-        let rest = s
+        let mut rest = s
             .strip_prefix("wc:")
             .ok_or_else(|| invalid(format!("missing `wc:` scheme in `{input}`")))?;
-        // `wc://topic@2?...` is used by some Android deep links.
-        let rest = rest.strip_prefix("//").unwrap_or(rest);
+        // Deep links put the scheme in front of the URI once more:
+        // `wc://topic@2?...`, `wc://wc:topic@2?...` (Android) and
+        // `wc:wc:topic@2?...` (iOS) all mean `wc:topic@2?...`.
+        loop {
+            rest = rest.strip_prefix("//").unwrap_or(rest);
+            match rest.strip_prefix("wc:") {
+                Some(inner) => rest = inner,
+                None => break,
+            }
+        }
         let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
         let (topic, version) = path
             .split_once('@')
@@ -189,12 +206,20 @@ mod tests {
 
     #[test]
     fn accepts_deep_link_and_base64_forms() {
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+
         let plain = format!("wc:{TOPIC}@2?relay-protocol=irn&symKey={KEY}");
-        let deep = format!("wc://{TOPIC}@2?relay-protocol=irn&symKey={KEY}");
-        let b64 = STANDARD.encode(&plain);
-        for s in [&plain, &deep, &b64] {
+        let forms = [
+            plain.clone(),
+            format!("wc://{TOPIC}@2?relay-protocol=irn&symKey={KEY}"),
+            format!("wc://{plain}"),
+            format!("wc:{plain}"),
+            STANDARD.encode(&plain),
+            STANDARD_NO_PAD.encode(&plain),
+        ];
+        for s in &forms {
             let uri: PairingUri = s.parse().unwrap();
-            assert_eq!(uri.topic.as_str(), TOPIC);
+            assert_eq!(uri.topic.as_str(), TOPIC, "{s}");
         }
     }
 

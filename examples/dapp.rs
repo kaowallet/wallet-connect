@@ -1,5 +1,5 @@
 //! A minimal dapp: proposes a session, asks for a `personal_sign`, pings,
-//! disconnects.
+//! extends the session, disconnects.
 //!
 //! ```sh
 //! # against a local relay (see the relay_server example)
@@ -132,6 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client.ping(&session.topic).await?;
     println!("ping ok");
+
+    client.extend(&session.topic).await?.await?;
+    println!("extend ok");
 
     client.disconnect(&session.topic).await?;
     println!("disconnected");

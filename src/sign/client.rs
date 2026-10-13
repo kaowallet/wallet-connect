@@ -24,8 +24,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::errors::{InternalError, SdkError};
 use super::namespaces::{
-    ensure_conforming, session_events_for_chain, session_has_chain, session_methods_for_chain,
-    validate_proposal_namespaces, validate_session_namespaces,
+    ensure_conforming, namespace_key, session_events_for_chain, session_has_chain,
+    session_methods_for_chain, validate_proposal_namespaces, validate_session_namespaces,
 };
 use super::rpc::{self, methods};
 use super::types::*;
@@ -69,7 +69,7 @@ pub enum SignEvent {
         topic: Topic,
         namespaces: SessionNamespaces,
     },
-    /// Dapp: the wallet extended the session.
+    /// The peer extended the session.
     SessionExtend {
         id: u64,
         topic: Topic,
@@ -463,6 +463,46 @@ fn is_out_of_sync(last: Option<u64>, id: u64) -> bool {
     last.is_some_and(|last| id / 1000 < last / 1000)
 }
 
+/// Every property needs a value, as in the reference SDK.
+fn validate_properties(properties: Option<&Properties>, what: &str) -> Result<()> {
+    match properties.into_iter().flatten().find(|(_, v)| v.is_null()) {
+        Some((key, _)) => Err(protocol(
+            InternalError::MissingOrInvalid,
+            format!(
+                "{what} must contain an existing value for each key. Received: null for key {key}"
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Scoped properties may only be keyed by namespaces (or chains of
+/// namespaces) among `namespaces`.
+fn validate_scoped_properties<'a>(
+    scoped: Option<&Properties>,
+    namespaces: impl IntoIterator<Item = &'a String>,
+    what: &str,
+) -> Result<()> {
+    let Some(scoped) = scoped else {
+        return Ok(());
+    };
+    validate_properties(Some(scoped), "scopedProperties")?;
+    let mut allowed: Vec<&str> = namespaces.into_iter().map(|k| namespace_key(k)).collect();
+    allowed.sort_unstable();
+    allowed.dedup();
+    if scoped.keys().all(|k| allowed.contains(&namespace_key(k))) {
+        return Ok(());
+    }
+    Err(protocol(
+        InternalError::MissingOrInvalid,
+        format!(
+            "Scoped properties must be a subset of {what}, received: {}, {what}: {}",
+            Value::Object(scoped.clone()),
+            allowed.join(", ")
+        ),
+    ))
+}
+
 impl SignClient {
     /// Start configuring a client that presents itself with `metadata`.
     pub fn builder(metadata: Metadata) -> SignClientBuilder {
@@ -531,6 +571,15 @@ impl SignClient {
             .map_err(Error::Protocol)?;
         validate_proposal_namespaces(&params.optional_namespaces, "connect() optionalNamespaces")
             .map_err(Error::Protocol)?;
+        validate_properties(params.session_properties.as_ref(), "sessionProperties")?;
+        validate_scoped_properties(
+            params.scoped_properties.as_ref(),
+            params
+                .required_namespaces
+                .keys()
+                .chain(params.optional_namespaces.keys()),
+            "required/optional namespaces",
+        )?;
 
         let (pairing_topic, uri) = match params.pairing_topic {
             Some(topic) => {
@@ -692,7 +741,8 @@ impl SignClient {
     // ----- wallet --------------------------------------------------------
 
     /// Pair with a dapp using the URI it displayed. The proposal follows as
-    /// a [`SignEvent::SessionProposal`].
+    /// a [`SignEvent::SessionProposal`]; pairing the same URI again while
+    /// that proposal is unanswered emits it again.
     pub async fn pair(&self, uri: &str) -> Result<Pairing> {
         self.pair_uri(uri.parse()?).await
     }
@@ -715,7 +765,7 @@ impl SignClient {
             peer_metadata: None,
             methods: uri.methods,
         };
-        {
+        let pending = {
             let mut st = inner.state();
             if st.pairings.get(&uri.topic).is_some_and(|p| p.active) {
                 return Err(protocol(
@@ -728,12 +778,24 @@ impl SignClient {
             }
             st.pairings.insert(uri.topic.clone(), pairing.clone());
             st.sym_keys.entry(uri.topic.clone()).or_insert(uri.sym_key);
-        }
+            // Proposals already received over this pairing (and not yet
+            // answered) when the same URI is scanned again, e.g. after the
+            // app was closed before the user decided.
+            st.proposals
+                .values()
+                .filter(|p| p.pairing_topic == uri.topic && !is_expired(p.expiry_timestamp))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         if let Err(e) = inner.relay.subscribe(&uri.topic).await {
             let mut st = inner.state();
             st.pairings.remove(&uri.topic);
             st.sym_keys.remove(&uri.topic);
             return Err(e);
+        }
+        // Like the reference SDK, show them again.
+        for proposal in pending {
+            inner.emit(SignEvent::SessionProposal(proposal));
         }
         Ok(pairing)
     }
@@ -770,6 +832,12 @@ impl SignClient {
             "approve()",
         )
         .map_err(Error::Protocol)?;
+        validate_properties(params.session_properties.as_ref(), "sessionProperties")?;
+        validate_scoped_properties(
+            params.scoped_properties.as_ref(),
+            params.namespaces.keys(),
+            "approved namespaces",
+        )?;
 
         let relay = proposal.relays.first().cloned().unwrap_or_default();
         let key_pair = KeyPair::generate();
@@ -863,7 +931,8 @@ impl SignClient {
         })
     }
 
-    /// Reject proposal `id`, e.g. with [`SdkError::UserRejected`].
+    /// Reject proposal `id`, e.g. with [`SdkError::UserRejected`]. The reason
+    /// needs a non-zero code and a message.
     pub async fn reject(&self, id: u64, reason: impl Into<ErrorObject>) -> Result<()> {
         let inner = &self.inner;
         let proposal = inner
@@ -872,13 +941,20 @@ impl SignClient {
             .get(&id)
             .cloned()
             .ok_or(Error::NoProposal(id))?;
+        let reason = reason.into();
+        if reason.code == 0 || reason.message.trim().is_empty() {
+            return Err(protocol(
+                InternalError::MissingOrInvalid,
+                format!("reject() reason: {}", json!(reason)),
+            ));
+        }
         let opts = rpc::options(methods::SESSION_PROPOSE).and_then(|o| o.reject);
         inner
             .send_error(
                 &proposal.pairing_topic,
                 id,
                 methods::SESSION_PROPOSE,
-                reason.into(),
+                reason,
                 opts,
             )
             .await?;
@@ -962,16 +1038,15 @@ impl SignClient {
         }
     }
 
-    /// Extend a session this client controls to seven days from now.
+    /// Extend a session to seven days from now. Either peer may extend, as
+    /// with the reference SDK; the returned value resolves when the peer
+    /// acknowledged the extension.
     pub async fn extend(&self, topic: &Topic) -> Result<Pending<()>> {
         let inner = &self.inner;
         let expiry = expiry_in(SEVEN_DAYS);
         {
             let mut st = inner.state();
-            let session = st.session(topic)?;
-            if !session.is_controller() {
-                return Err(Error::Protocol(SdkError::UnauthorizedExtendRequest.error()));
-            }
+            st.session(topic)?;
             st.sessions.get_mut(topic).expect("checked above").expiry = expiry;
         }
         let params = SessionExtendParams {
@@ -1315,6 +1390,36 @@ impl Inner {
         }
         if let Err(e) = self.relay.unsubscribe(topic).await {
             tracing::debug!(%topic, "unsubscribe failed: {e}");
+        }
+    }
+
+    /// Dapp: delete older pairings with the wallet a session was just settled
+    /// with (same metadata URL), like the reference SDK. Every `connect`
+    /// creates a pairing, and active pairings otherwise live for 30 days.
+    async fn cleanup_duplicate_pairings(&self, session: &Session) {
+        let url = &session.peer.metadata.url;
+        if url.is_empty() {
+            return;
+        }
+        let duplicates: Vec<Topic> = self
+            .state()
+            .pairings
+            .values()
+            .filter(|p| {
+                p.topic != session.pairing_topic
+                    && p.peer_metadata.as_ref().is_some_and(|m| &m.url == url)
+            })
+            .map(|p| p.topic.clone())
+            .collect();
+        for topic in duplicates {
+            let reason = json!(SdkError::UserDisconnected.error());
+            if let Err(e) = self
+                .send_notification(&topic, methods::PAIRING_DELETE, reason)
+                .await
+            {
+                tracing::debug!(%topic, "telling the peer about a duplicate pairing failed: {e}");
+            }
+            self.delete_pairing(&topic).await;
         }
     }
 
@@ -1678,7 +1783,8 @@ impl Inner {
                 }
                 let answered = self.answer(topic, &req, &Ok(())).await;
                 self.emit(SignEvent::SessionConnect(session.clone()));
-                self.resolve_approval(proposal_id, Ok(session));
+                self.resolve_approval(proposal_id, Ok(session.clone()));
+                self.cleanup_duplicate_pairings(&session).await;
                 answered
             }
             Err(e) => {
@@ -1752,13 +1858,11 @@ impl Inner {
         }
     }
 
+    /// Either peer may extend: the reference SDK lets dapps call `extend` too.
     async fn on_session_extend(&self, topic: &Topic, req: Request) -> Result<()> {
         let outcome = (|| -> Result<u64> {
             let mut st = self.state();
-            let session = st.session(topic)?;
-            if session.peer.public_key != session.controller {
-                return Err(Error::Protocol(SdkError::UnauthorizedExtendRequest.error()));
-            }
+            st.session(topic)?;
             let expiry = expiry_in(SEVEN_DAYS);
             st.sessions.get_mut(topic).expect("checked above").expiry = expiry;
             Ok(expiry)

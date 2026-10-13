@@ -1,4 +1,5 @@
-// Reference-SDK dapp: connect, wait for approval, personal_sign, ping, disconnect.
+// Reference-SDK dapp: connect, wait for approval, personal_sign, ping, extend,
+// disconnect.
 // Prints the pairing URI on a line starting with "URI ".
 import { getSdkError } from "@walletconnect/utils";
 import { ADDRESS, fail, init, log } from "./common.mjs";
@@ -47,6 +48,11 @@ try {
 
 await client.ping({ topic: session.topic });
 log("ping ok");
+
+// The reference SDK lets dapps extend sessions too; the wallet must accept it.
+const { acknowledged: extended } = await client.extend({ topic: session.topic });
+await extended();
+log("extend ok");
 
 // Give the wallet's accountsChanged event time to arrive.
 for (let i = 0; i < 50 && !sawEvent; i++) await new Promise((r) => setTimeout(r, 100));

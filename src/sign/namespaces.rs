@@ -66,17 +66,34 @@ pub fn proposal_namespace_chains(key: &str, ns: &ProposalNamespace) -> Vec<Strin
     }
 }
 
+/// Methods and events must be non-blank strings, as in the reference SDK's
+/// `isValidActions`.
+fn validate_actions(
+    methods: &[String],
+    events: &[String],
+    context: &str,
+) -> Result<(), ErrorObject> {
+    let blank = |names: &[String]| names.iter().any(|n| n.trim().is_empty());
+    if blank(methods) {
+        return Err(SdkError::UnsupportedMethods.with_context(format!(
+            "{context}: methods should be an array of non-empty strings or empty array for no methods"
+        )));
+    }
+    if blank(events) {
+        return Err(SdkError::UnsupportedEvents.with_context(format!(
+            "{context}: events should be an array of non-empty strings or empty array for no events"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate proposal (required or optional) namespaces.
 pub fn validate_proposal_namespaces(
     namespaces: &ProposalNamespaces,
     context: &str,
 ) -> Result<(), ErrorObject> {
     for (key, ns) in namespaces {
-        if ns.methods.iter().chain(&ns.events).any(String::is_empty) {
-            return Err(SdkError::UnsupportedMethods.with_context(format!(
-                "{context}: methods and events must be non-empty strings"
-            )));
-        }
+        validate_actions(&ns.methods, &ns.events, context)?;
         let chains = ns.chains.as_deref().unwrap_or_default();
         if !chains.is_empty() {
             if let Some(bad) = chains.iter().find(|c| !is_chain_id(c)) {
@@ -113,11 +130,7 @@ pub fn validate_session_namespaces(
         )));
     }
     for (key, ns) in namespaces {
-        if ns.methods.iter().chain(&ns.events).any(String::is_empty) {
-            return Err(SdkError::UnsupportedMethods.with_context(format!(
-                "{context}: methods and events must be non-empty strings"
-            )));
-        }
+        validate_actions(&ns.methods, &ns.events, context)?;
         if let Some(bad) = ns.accounts.iter().find(|a| !is_account_id(a)) {
             return Err(SdkError::UnsupportedAccounts.with_context(format!(
                 "{context}: account {bad} should conform to \"namespace:chainId:address\" format"
@@ -499,6 +512,23 @@ mod tests {
                 .code,
             5104
         );
+
+        // Blank methods and events are rejected with their own codes.
+        for (methods, events, code) in [(" ", "e", 5101), ("m", "", 5102), ("m", " ", 5102)] {
+            let ns: ProposalNamespaces = BTreeMap::from([(
+                "eip155".to_owned(),
+                ProposalNamespace::new(["eip155:1"], [methods], [events]),
+            )]);
+            assert_eq!(
+                validate_proposal_namespaces(&ns, "t").unwrap_err().code,
+                code
+            );
+            let session = session(&["eip155:1:0xabc"], &[methods], &[events]);
+            assert_eq!(
+                validate_session_namespaces(&session, "t").unwrap_err().code,
+                code
+            );
+        }
     }
 
     #[test]
