@@ -32,7 +32,9 @@ use super::types::*;
 use crate::crypto::{Envelope, KeyPair, PublicKey, SymKey, TYPE_0, Topic, sha256_hex};
 use crate::error::{Error, Result};
 use crate::relay::rpc::SubscriptionData;
-use crate::relay::{Connector, PublishOptions, RelayClient, RelayClientOptions, RelayEvent};
+use crate::relay::{
+    Connector, PublishOptions, RelayClient, RelayClientOptions, RelayEvent, RequestError,
+};
 use crate::rpc::{ErrorObject, Payload, Request, Response, payload_id};
 use crate::time::{
     FIFTEEN_MINUTES, FIVE_MINUTES, SEVEN_DAYS, THIRTY_DAYS, expiry_in, is_expired, now_secs,
@@ -168,7 +170,10 @@ pub struct ConnectResponse {
 #[derive(Debug)]
 pub struct Approved {
     pub session: Session,
-    /// Resolves once the dapp acknowledged the settlement.
+    /// Resolves once the dapp acknowledged the settlement. Fails with
+    /// [`Error::Timeout`] if no acknowledgement arrives, e.g. because the
+    /// settlement never reached the dapp. The session is kept until it
+    /// expires or is disconnected either way.
     pub acknowledged: Pending<()>,
 }
 
@@ -800,7 +805,8 @@ impl SignClient {
         Ok(pairing)
     }
 
-    /// Approve proposal `id` granting `namespaces`.
+    /// Approve proposal `id` granting `namespaces`. See
+    /// [`SignClient::approve_with`] for what a relay failure leaves behind.
     pub async fn approve(&self, id: u64, namespaces: SessionNamespaces) -> Result<Approved> {
         self.approve_with(ApproveParams {
             id,
@@ -810,6 +816,17 @@ impl SignClient {
         .await
     }
 
+    /// Approve a proposal, with session and scoped properties.
+    ///
+    /// If the relay refuses the answer to the proposal or never gets it,
+    /// this fails and changes nothing: the proposal can be answered again.
+    /// Once the answer may have reached the dapp, the proposal is answered
+    /// for good, and the settlement decides the rest. If the relay refuses
+    /// the settlement or never gets it, the dapp cannot have the session:
+    /// this fails and drops it. Otherwise the session is kept and returned,
+    /// even when the relay did not confirm the settlement (a timeout or a
+    /// dropped connection), and [`Approved::acknowledged`] tells whether the
+    /// dapp has it.
     pub async fn approve_with(&self, params: ApproveParams) -> Result<Approved> {
         let inner = &self.inner;
         let proposal = {
@@ -847,6 +864,13 @@ impl SignClient {
             public_key: key_pair.public_key(),
             metadata: inner.metadata.clone(),
         };
+        let answer = Response::result(
+            params.id,
+            serde_json::to_value(SessionProposeResponse {
+                relay: relay.clone(),
+                responder_public_key: key_pair.public_key(),
+            })?,
+        );
         let settle = SessionSettleParams {
             relay: relay.clone(),
             namespaces: params.namespaces.clone(),
@@ -870,55 +894,72 @@ impl SignClient {
             local,
             peer: proposal.proposer.clone(),
         };
+        let settle = Request::with_id(
+            payload_id(),
+            methods::SESSION_SETTLE,
+            serde_json::to_value(&settle)?,
+        );
 
         inner
             .state()
             .sym_keys
             .insert(session_topic.clone(), sym_key);
-        let established = async {
-            inner.relay.subscribe(&session_topic).await?;
-            inner
-                .state()
-                .sessions
-                .insert(session_topic.clone(), session.clone());
-            let response = SessionProposeResponse {
-                relay: relay.clone(),
-                responder_public_key: key_pair.public_key(),
-            };
-            inner
-                .send_result(
-                    &proposal.pairing_topic,
-                    params.id,
-                    methods::SESSION_PROPOSE,
-                    serde_json::to_value(response)?,
-                )
-                .await?;
-            inner
-                .send_request(
-                    &session_topic,
-                    methods::SESSION_SETTLE,
-                    serde_json::to_value(&settle)?,
-                    None,
-                )
-                .await
+        if let Err(e) = inner.relay.subscribe(&session_topic).await {
+            inner.abandon_session(&session_topic).await;
+            return Err(e);
         }
-        .await;
-        let (_, ack) = match established {
-            Ok(sent) => sent,
-            Err(e) => {
-                {
-                    let mut st = inner.state();
-                    st.sessions.remove(&session_topic);
-                    st.sym_keys.remove(&session_topic);
-                }
-                let _ = inner.relay.unsubscribe(&session_topic).await;
+        inner
+            .state()
+            .sessions
+            .insert(session_topic.clone(), session.clone());
+
+        // Once the answer may have reached the dapp, the dapp may be waiting
+        // for the settlement and would ignore another answer: the proposal
+        // is answered for good.
+        let opts = rpc::options(methods::SESSION_PROPOSE)
+            .unwrap_or(rpc::UNREGISTERED)
+            .response;
+        match inner
+            .try_publish_payload(&proposal.pairing_topic, &answer, opts)
+            .await
+        {
+            Ok(()) => {}
+            Err(RequestError::Unconfirmed(e)) => {
+                tracing::warn!(
+                    id = params.id,
+                    "the relay did not confirm the proposal answer: {e}"
+                );
+            }
+            Err(RequestError::Failed(e)) => {
+                inner.abandon_session(&session_topic).await;
                 return Err(e);
             }
-        };
+        }
+        inner.state().proposals.remove(&params.id);
+
+        // Once the settlement may have reached the dapp, so may the session:
+        // keep it, and let the dapp's acknowledgement tell.
+        let opts = rpc::options(methods::SESSION_SETTLE)
+            .unwrap_or(rpc::UNREGISTERED)
+            .request;
+        let ack = inner.track_request(settle.id, &session_topic, &settle.method, opts.ttl);
+        match inner
+            .try_publish_payload(&session_topic, &settle, opts)
+            .await
+        {
+            Ok(()) => {}
+            Err(RequestError::Unconfirmed(e)) => {
+                tracing::warn!(topic = %session_topic, "the relay did not confirm the settlement: {e}");
+            }
+            Err(RequestError::Failed(e)) => {
+                inner.forget_request(settle.id);
+                inner.abandon_session(&session_topic).await;
+                return Err(e);
+            }
+        }
 
         {
             let mut st = inner.state();
-            st.proposals.remove(&params.id);
             if let Some(pairing) = st.pairings.get_mut(&proposal.pairing_topic) {
                 pairing.active = true;
                 pairing.expiry = expiry_in(THIRTY_DAYS);
@@ -1250,19 +1291,58 @@ impl Inner {
         payload: &impl Serialize,
         opts: PublishOptions,
     ) -> Result<()> {
-        let message = {
-            let mut st = self.state();
-            let key =
-                st.sym_keys.get(topic).cloned().ok_or_else(|| {
-                    protocol(InternalError::NoMatchingKey, format!("topic {topic}"))
-                })?;
-            let message = key.encrypt(&serde_json::to_vec(payload)?);
-            // Remember our own message so that an echo from the relay is
-            // ignored.
-            st.remember(sha256_hex(message.as_bytes()));
-            message
-        };
-        self.relay.publish(topic, &message, opts).await
+        Ok(self.try_publish_payload(topic, payload, opts).await?)
+    }
+
+    /// [`Inner::publish_payload`], telling apart the failures after which
+    /// the peer may get the message anyway.
+    async fn try_publish_payload(
+        &self,
+        topic: &Topic,
+        payload: &impl Serialize,
+        opts: PublishOptions,
+    ) -> Result<(), RequestError> {
+        let message = self.seal(topic, payload).map_err(RequestError::Failed)?;
+        self.relay.try_publish(topic, &message, opts).await
+    }
+
+    fn seal(&self, topic: &Topic, payload: &impl Serialize) -> Result<String> {
+        let mut st = self.state();
+        let key = st
+            .sym_keys
+            .get(topic)
+            .cloned()
+            .ok_or_else(|| protocol(InternalError::NoMatchingKey, format!("topic {topic}")))?;
+        let message = key.encrypt(&serde_json::to_vec(payload)?);
+        // Remember our own message so that an echo from the relay is ignored.
+        st.remember(sha256_hex(message.as_bytes()));
+        Ok(message)
+    }
+
+    /// Route the response to request `id` to the returned receiver.
+    fn track_request(
+        &self,
+        id: u64,
+        topic: &Topic,
+        method: &str,
+        ttl: u64,
+    ) -> oneshot::Receiver<Result<Value>> {
+        let (tx, rx) = oneshot::channel();
+        self.state().history.insert(
+            id,
+            Record {
+                topic: topic.clone(),
+                method: method.to_owned(),
+                expiry: expiry_in(ttl + FIVE_MINUTES),
+            },
+        );
+        self.waiters.lock().unwrap().insert(id, tx);
+        rx
+    }
+
+    fn forget_request(&self, id: u64) {
+        self.state().history.remove(&id);
+        self.waiters.lock().unwrap().remove(&id);
     }
 
     async fn send_request(
@@ -1288,20 +1368,10 @@ impl Inner {
         if let Some(ttl) = ttl {
             opts.ttl = ttl;
         }
-        let (tx, rx) = oneshot::channel();
-        self.state().history.insert(
-            id,
-            Record {
-                topic: topic.clone(),
-                method: method.to_owned(),
-                expiry: expiry_in(opts.ttl + FIVE_MINUTES),
-            },
-        );
-        self.waiters.lock().unwrap().insert(id, tx);
+        let rx = self.track_request(id, topic, method, opts.ttl);
         let request = Request::with_id(id, method, params);
         if let Err(e) = self.publish_payload(topic, &request, opts).await {
-            self.state().history.remove(&id);
-            self.waiters.lock().unwrap().remove(&id);
+            self.forget_request(id);
             return Err(e);
         }
         Ok((id, rx))
@@ -1380,6 +1450,16 @@ impl Inner {
         if let Err(e) = self.relay.unsubscribe(topic).await {
             tracing::debug!(%topic, "unsubscribe failed: {e}");
         }
+    }
+
+    /// Wallet: drop a session `approve` set up that the dapp cannot have.
+    async fn abandon_session(&self, topic: &Topic) {
+        {
+            let mut st = self.state();
+            st.sessions.remove(topic);
+            st.sym_keys.remove(topic);
+        }
+        let _ = self.relay.unsubscribe(topic).await;
     }
 
     async fn delete_pairing(&self, topic: &Topic) {

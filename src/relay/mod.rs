@@ -8,6 +8,7 @@ mod transport;
 #[cfg(feature = "ws")]
 mod ws;
 
+pub(crate) use client::RequestError;
 pub use client::{PublishOptions, RelayClient, RelayClientOptions, RelayEvent};
 #[doc(hidden)]
 pub use server::ServerStats;
