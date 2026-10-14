@@ -1,13 +1,14 @@
 //! End-to-end Sign API flows between a dapp client and a wallet client.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::time::timeout;
 use wallet_connect::Error;
 use wallet_connect::crypto::Topic;
-use wallet_connect::relay::RelayServer;
+use wallet_connect::relay::{BoxFuture, Connection, Connector, RelayClientOptions, RelayServer};
 use wallet_connect::sign::{
     ConnectParams, Metadata, ProposalNamespace, ProposalNamespaces, SdkError, Session,
     SessionEvent, SessionNamespace, SessionNamespaces, SessionRequest, SignClient,
@@ -614,6 +615,287 @@ async fn pairing_uri_cannot_be_reused_once_active() {
     connect.approval.await.unwrap();
     assert!(matches!(wallet.pair(&uri).await, Err(Error::Protocol(_))));
     assert!(wallet.pair("wc:nonsense").await.is_err());
+}
+
+/// What [`Meddler`] does to a publish.
+#[derive(Clone, Copy)]
+enum Meddle {
+    /// The relay takes the message, but its answer never comes back.
+    LoseAnswer,
+    /// The relay refuses the message.
+    Refuse,
+}
+
+/// A connector to an in-process relay that meddles with the client's next
+/// `irn_publish` carrying a given tag.
+#[derive(Clone)]
+struct Meddler {
+    server: RelayServer,
+    client_id: &'static str,
+    next: Arc<Mutex<Option<(u32, Meddle)>>>,
+}
+
+impl Meddler {
+    fn new(server: &RelayServer, client_id: &'static str) -> Self {
+        Meddler {
+            server: server.clone(),
+            client_id,
+            next: Arc::default(),
+        }
+    }
+
+    fn next_publish(&self, tag: u32, meddle: Meddle) {
+        *self.next.lock().unwrap() = Some((tag, meddle));
+    }
+}
+
+impl Connector for Meddler {
+    fn connect(&self) -> BoxFuture<wallet_connect::Result<Connection>> {
+        let meddler = self.clone();
+        Box::pin(async move {
+            let Connection {
+                sender: to_server,
+                receiver: mut from_server,
+            } = meddler.server.accept(meddler.client_id);
+            let (client_end, proxy_end) = Connection::pair();
+            let Connection {
+                sender: to_client,
+                receiver: mut from_client,
+            } = proxy_end;
+            tokio::spawn(async move {
+                let mut lost = HashSet::new();
+                loop {
+                    tokio::select! {
+                        frame = from_client.recv() => {
+                            let Some(text) = frame else { break };
+                            let request: Value = serde_json::from_str(&text).unwrap();
+                            let meddle = {
+                                let mut next = meddler.next.lock().unwrap();
+                                match *next {
+                                    Some((tag, meddle))
+                                        if request["method"] == "irn_publish"
+                                            && request["params"]["tag"] == tag =>
+                                    {
+                                        *next = None;
+                                        Some(meddle)
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            let id = request["id"].as_u64().unwrap();
+                            match meddle {
+                                Some(Meddle::LoseAnswer) => {
+                                    lost.insert(id);
+                                }
+                                Some(Meddle::Refuse) => {
+                                    let refusal = json!({
+                                        "id": id,
+                                        "jsonrpc": "2.0",
+                                        "error": {"code": -32000, "message": "refused"},
+                                    });
+                                    let _ = to_client.send(refusal.to_string());
+                                    continue;
+                                }
+                                None => {}
+                            }
+                            if to_server.send(text).is_err() {
+                                break;
+                            }
+                        }
+                        frame = from_server.recv() => {
+                            let Some(text) = frame else { break };
+                            let answer: Value = serde_json::from_str(&text).unwrap();
+                            if answer.get("method").is_none()
+                                && answer["id"].as_u64().is_some_and(|id| lost.remove(&id))
+                            {
+                                continue;
+                            }
+                            if to_client.send(text).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(client_end)
+        })
+    }
+}
+
+/// A proposal from a dapp, received by a wallet whose relay traffic goes
+/// through a [`Meddler`].
+struct Proposed {
+    dapp: SignClient,
+    approval: wallet_connect::sign::Pending<Session>,
+    wallet: SignClient,
+    wallet_events: SignEvents,
+    meddler: Meddler,
+    id: u64,
+    namespaces: SessionNamespaces,
+}
+
+async fn propose_to_meddled_wallet(server: &RelayServer) -> Proposed {
+    let (dapp, _) = client(server, "dapp").await;
+    let meddler = Meddler::new(server, "wallet");
+    let (wallet, mut wallet_events) = SignClient::builder(Metadata::new(
+        "wallet",
+        "wallet (test)",
+        "https://wallet.example",
+    ))
+    .connector(meddler.clone())
+    .options(options())
+    .relay_options(RelayClientOptions {
+        request_timeout: Duration::from_millis(500),
+        ..Default::default()
+    })
+    .build()
+    .await
+    .unwrap();
+    let connect = dapp
+        .connect(ConnectParams {
+            required_namespaces: required(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    wallet
+        .pair(&connect.uri.unwrap().to_string())
+        .await
+        .unwrap();
+    let SignEvent::SessionProposal(proposal) = next(&mut wallet_events).await else {
+        panic!("expected a proposal")
+    };
+    let namespaces = build_approved_namespaces(
+        &proposal.required_namespaces,
+        &proposal.optional_namespaces,
+        &supported(),
+    )
+    .unwrap();
+    Proposed {
+        dapp,
+        approval: connect.approval,
+        wallet,
+        wallet_events,
+        meddler,
+        id: proposal.id,
+        namespaces,
+    }
+}
+
+#[tokio::test]
+async fn approve_keeps_the_session_when_the_relay_does_not_confirm_the_settlement() {
+    let server = RelayServer::new();
+    let Proposed {
+        dapp,
+        approval,
+        wallet,
+        mut wallet_events,
+        meddler,
+        id,
+        namespaces,
+    } = propose_to_meddled_wallet(&server).await;
+
+    // The relay passes the settlement on, but the wallet never hears back.
+    meddler.next_publish(1102, Meddle::LoseAnswer);
+    let approved = wallet.approve(id, namespaces).await.unwrap();
+    assert!(wallet.proposals().is_empty());
+
+    // The dapp has the session, so the wallet must still have it too.
+    let session = approval.await.unwrap();
+    assert_eq!(session.topic, approved.session.topic);
+    approved.acknowledged.await.unwrap();
+    assert!(wallet.session(&session.topic).unwrap().acknowledged);
+
+    let topic = session.topic.clone();
+    let request = tokio::spawn(async move {
+        dapp.request(
+            &topic,
+            "eip155:1",
+            SessionRequest::new("personal_sign", json!(["0x00"])),
+        )
+        .await
+    });
+    let SignEvent::SessionRequest(pending) = next(&mut wallet_events).await else {
+        panic!("expected a session request")
+    };
+    wallet
+        .respond(&session.topic, pending.id, Ok(json!("0x04")))
+        .await
+        .unwrap();
+    assert_eq!(request.await.unwrap().unwrap(), json!("0x04"));
+}
+
+#[tokio::test]
+async fn approve_settles_when_the_relay_does_not_confirm_the_answer() {
+    let server = RelayServer::new();
+    let Proposed {
+        dapp: _dapp,
+        approval,
+        wallet,
+        meddler,
+        id,
+        namespaces,
+        ..
+    } = propose_to_meddled_wallet(&server).await;
+
+    // The dapp gets the answer and waits for the settlement.
+    meddler.next_publish(1101, Meddle::LoseAnswer);
+    let approved = wallet.approve(id, namespaces).await.unwrap();
+    let session = approval.await.unwrap();
+    assert_eq!(session.topic, approved.session.topic);
+    approved.acknowledged.await.unwrap();
+}
+
+#[tokio::test]
+async fn approve_changes_nothing_when_the_relay_refuses_the_answer() {
+    let server = RelayServer::new();
+    let Proposed {
+        dapp: _dapp,
+        approval,
+        wallet,
+        meddler,
+        id,
+        namespaces,
+        ..
+    } = propose_to_meddled_wallet(&server).await;
+
+    meddler.next_publish(1101, Meddle::Refuse);
+    assert!(matches!(
+        wallet.approve(id, namespaces.clone()).await,
+        Err(Error::Relay(_))
+    ));
+    assert!(wallet.sessions().is_empty());
+
+    // Nothing reached the dapp: the proposal can be answered again.
+    assert_eq!(wallet.proposals().len(), 1);
+    let approved = wallet.approve(id, namespaces).await.unwrap();
+    assert_eq!(approval.await.unwrap().topic, approved.session.topic);
+}
+
+#[tokio::test]
+async fn approve_drops_the_session_when_the_relay_refuses_the_settlement() {
+    let server = RelayServer::new();
+    let Proposed {
+        wallet,
+        meddler,
+        id,
+        namespaces,
+        ..
+    } = propose_to_meddled_wallet(&server).await;
+
+    meddler.next_publish(1102, Meddle::Refuse);
+    assert!(matches!(
+        wallet.approve(id, namespaces.clone()).await,
+        Err(Error::Relay(_))
+    ));
+    // Without the settlement the dapp has no session.
+    assert!(wallet.sessions().is_empty());
+    // But it has the answer and would ignore another one.
+    assert!(wallet.proposals().is_empty());
+    assert!(matches!(
+        wallet.approve(id, namespaces).await,
+        Err(Error::NoProposal(_))
+    ));
 }
 
 #[cfg(feature = "ws")]

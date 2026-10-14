@@ -78,6 +78,12 @@ These differences are kept. The tests assert this crate's behavior and say so.
   combined calls are available on `RelayClient`.
 * **`wc_sessionEvent` response.** The reference dapp does not answer events.
   This crate answers with `true`, which a JS wallet ignores.
+* **Unconfirmed approvals.** The reference `approve()` deletes the session
+  whenever publishing the approval fails, including after a timeout, when
+  the dapp may already have the session. This crate keeps the session unless
+  the relay refused the settlement or never got it, and
+  `Approved::acknowledged` tells whether the dapp has it (`tests/sign.rs`
+  `approve_*`).
 * **Local validation errors** are typed: unknown records are `NoSession`,
   `NoPairing`, `NoProposal` and `NoRequest`, and unsupported chains, methods
   and events are 5100/3001/3002 where the reference throws code 5 ("Missing

@@ -63,6 +63,25 @@ pub enum RelayEvent {
     Disconnected,
 }
 
+/// Why a relay request failed, and whether the relay may have acted on it.
+#[derive(Debug)]
+pub(crate) enum RequestError {
+    /// The request never reached the relay, or the relay refused it.
+    Failed(Error),
+    /// The request went out but no answer came back: it timed out, or the
+    /// connection dropped or the client closed first. The relay may have
+    /// processed it.
+    Unconfirmed(Error),
+}
+
+impl From<RequestError> for Error {
+    fn from(e: RequestError) -> Self {
+        match e {
+            RequestError::Failed(e) | RequestError::Unconfirmed(e) => e,
+        }
+    }
+}
+
 type Waiter = oneshot::Sender<Result<Value>>;
 
 #[derive(Default)]
@@ -142,34 +161,59 @@ impl RelayClient {
         method: &str,
         params: P,
     ) -> Result<R> {
-        let request = Request::new(method, serde_json::to_value(params)?);
+        let result = self.call(method, serde_json::to_value(params)?).await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// [`RelayClient::request`], telling apart the failures after which the
+    /// relay may have processed the request anyway.
+    async fn call(&self, method: &str, params: Value) -> Result<Value, RequestError> {
+        let request = Request::new(method, params);
         let id = request.id;
+        let text = serde_json::to_string(&request).map_err(|e| RequestError::Failed(e.into()))?;
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.inner.state.lock().unwrap();
             if state.closed {
-                return Err(Error::Closed);
+                return Err(RequestError::Failed(Error::Closed));
             }
-            let outbound = state.outbound.clone().ok_or(Error::Disconnected)?;
+            let outbound = state
+                .outbound
+                .clone()
+                .ok_or(RequestError::Failed(Error::Disconnected))?;
             state.pending.insert(id, tx);
-            if outbound.send(serde_json::to_string(&request)?).is_err() {
+            if outbound.send(text).is_err() {
                 state.pending.remove(&id);
-                return Err(Error::Disconnected);
+                return Err(RequestError::Failed(Error::Disconnected));
             }
         }
         tracing::trace!(id, method, "relay request");
         match tokio::time::timeout(self.inner.options.request_timeout, rx).await {
-            Ok(Ok(result)) => Ok(serde_json::from_value(result?)?),
-            Ok(Err(_)) => Err(Error::Disconnected),
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(e @ Error::Relay(_)))) => Err(RequestError::Failed(e)),
+            // The connection dropped or the client closed.
+            Ok(Ok(Err(e))) => Err(RequestError::Unconfirmed(e)),
+            Ok(Err(_)) => Err(RequestError::Unconfirmed(Error::Disconnected)),
             Err(_) => {
                 self.inner.state.lock().unwrap().pending.remove(&id);
-                Err(Error::Timeout)
+                Err(RequestError::Unconfirmed(Error::Timeout))
             }
         }
     }
 
     /// Publish an (already encrypted) message to `topic`.
     pub async fn publish(&self, topic: &Topic, message: &str, opts: PublishOptions) -> Result<()> {
+        Ok(self.try_publish(topic, message, opts).await?)
+    }
+
+    /// [`RelayClient::publish`], telling apart the failures after which the
+    /// relay may have accepted the message anyway.
+    pub(crate) async fn try_publish(
+        &self,
+        topic: &Topic,
+        message: &str,
+        opts: PublishOptions,
+    ) -> Result<(), RequestError> {
         let params = rpc::PublishParams {
             topic: topic.clone(),
             message: message.to_owned(),
@@ -178,8 +222,8 @@ impl RelayClient {
             prompt: opts.prompt.then_some(true),
             attestation: None,
         };
-        let _: Value = self.request(methods::PUBLISH, params).await?;
-        Ok(())
+        let params = serde_json::to_value(params).map_err(|e| RequestError::Failed(e.into()))?;
+        self.call(methods::PUBLISH, params).await.map(drop)
     }
 
     /// Subscribe to `topic`. Messages the relay holds for it are delivered

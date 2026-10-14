@@ -146,6 +146,10 @@ Compatibility choices worth knowing:
 * Pairing the same URI again while its proposal is unanswered emits the
   proposal again. When a dapp settles a session, it deletes its older pairings
   with the same wallet (same metadata URL).
+* When the relay doesn't confirm a wallet's settlement (a timeout or a
+  dropped connection), `approve` keeps the session, where the reference SDK
+  deletes it. The dapp may have it, and `Approved::acknowledged` tells
+  whether it does.
 * Unlike the reference SDK 2.26, `connect` sends `requiredNamespaces` as given
   instead of folding them into `optionalNamespaces`, wallets get every
   session request right away instead of one at a time, and an active pairing
